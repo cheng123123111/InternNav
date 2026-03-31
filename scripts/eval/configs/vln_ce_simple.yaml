@@ -1,0 +1,24 @@
+# @package _global_
+# Simple VLN-CE config following habitat package structure
+
+defaults:
+  - /habitat: habitat_config_base
+  - /habitat/task: vln_r2r
+  - /habitat/simulator/sensor_setups@habitat.simulator.agents.main_agent: rgbd_agent
+  - /habitat/dataset/vln: mp3d_r2r
+  - /habitat/task/actions:
+    - look_up
+    - look_down
+  - /habitat/task/lab_sensors:
+    - gps_sensor
+    - compass_sensor
+  - _self_
+
+habitat:
+  environment:
+    max_episode_steps: 1000
+  dataset:
+    split: val_unseen
+    scenes_dir: /mnt/data/VL-LN-Bench/scene_datasets/
+    data_path: /mnt/data/0923_Interndata/vln_ce/raw_data/r2r/{split}/{split}.json.gz
+    content_scenes: ["8194nk5LbLH"]

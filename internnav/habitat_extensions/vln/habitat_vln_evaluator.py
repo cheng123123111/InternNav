@@ -3,6 +3,7 @@ import json
 import os
 import sys
 from enum import IntEnum
+from typing import Optional
 
 sys.path.append('./src/diffusion-policy')
 import copy
@@ -108,6 +109,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self.model_args = argparse.Namespace(**cfg.agent.model_settings)
         self.vis_debug = bool(getattr(self.model_args, "vis_debug", False))
         self.vis_debug_path = getattr(self.model_args, "vis_debug_path", os.path.join(self.output_path, "vis_debug"))
+        self.disable_pixel_goal = bool(getattr(self.model_args, "disable_pixel_goal", False))
+        self.pixel_goal_strict_parse = bool(getattr(self.model_args, "pixel_goal_strict_parse", False))
+        self.pixel_goal_max_jump = float(getattr(self.model_args, "pixel_goal_max_jump", 0.0))
 
         processor = AutoProcessor.from_pretrained(self.model_args.model_path)
         processor.tokenizer.padding_side = 'left'
@@ -117,14 +121,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             model = InternVLAN1ForCausalLM.from_pretrained(
                 self.model_args.model_path,
                 torch_dtype=torch.bfloat16,
-                attn_implementation="flash_attention_2",
+                attn_implementation="eager",  # Changed from flash_attention_2
                 device_map={"": device},
             )
         elif self.model_args.mode == 'system2':
             model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 self.model_args.model_path,
                 torch_dtype=torch.bfloat16,
-                attn_implementation="flash_attention_2",
+                attn_implementation="eager",  # Changed from flash_attention_2
                 device_map={"": device},
             )
         else:
@@ -241,6 +245,50 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         actions = itertools.chain.from_iterable(actions)
         return list(actions)
 
+    def _run_vlm_text(self, prompt: str, images: list, max_new_tokens: int = 16) -> str:
+        messages = [{"role": "user", "content": []}]
+        parts = split_and_clean(prompt)
+        input_img_id = 0
+        for part in parts:
+            if part == DEFAULT_IMAGE_TOKEN:
+                messages[0]["content"].append({"type": "image", "image": images[input_img_id]})
+                input_img_id += 1
+            else:
+                messages[0]["content"].append({"type": "text", "text": part})
+
+        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = self.processor(text=[text], images=images, return_tensors="pt").to(self.model.device)
+        with torch.no_grad():
+            output_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                use_cache=True,
+                past_key_values=None,
+                return_dict_in_generate=True,
+            ).sequences
+        return self.processor.tokenizer.decode(output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True).strip()
+
+    def _parse_pixel_goal(
+        self, llm_outputs: str, last_pixel_goal: Optional[list] = None
+    ) -> tuple[Optional[list], Optional[str]]:
+        coords = [int(c) for c in re.findall(r"\d+", llm_outputs)]
+        if self.pixel_goal_strict_parse and len(coords) != 2:
+            return None, f"strict_parse_reject coords={coords}"
+        if len(coords) < 2:
+            return None, f"coord_count_reject coords={coords}"
+
+        pixel_goal = [int(coords[1]), int(coords[0])]
+        pixel_goal[0] = int(np.clip(pixel_goal[0], 0, self.model_args.resize_w - 1))
+        pixel_goal[1] = int(np.clip(pixel_goal[1], 0, self.model_args.resize_h - 1))
+
+        if self.pixel_goal_max_jump > 0 and last_pixel_goal is not None:
+            jump = float(np.linalg.norm(np.array(pixel_goal, dtype=np.float32) - np.array(last_pixel_goal, dtype=np.float32)))
+            if jump > self.pixel_goal_max_jump:
+                return None, f"jump_reject jump={jump:.1f} last={last_pixel_goal} now={pixel_goal}"
+
+        return pixel_goal, None
+
     def resume_from_output_path(self) -> None:
         sucs, spls, oss, nes, ndtw = [], [], [], [], []
         if self.rank != 0:
@@ -315,6 +363,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             done = False
             flag = False
             pixel_goal = None
+            last_valid_pixel_goal = None
 
             # ---------- 2. Episode step loop -----------
             while (not done) and (step_id <= self.max_steps_per_episode):
@@ -430,52 +479,73 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     print('step_id:', step_id, 'output text:', llm_outputs)
 
                     if bool(re.search(r'\d', llm_outputs)):  # output pixel goal
-                        forward_action = 0
-                        coord = [int(c) for c in re.findall(r'\d+', llm_outputs)]
-
-                        pixel_goal = [int(coord[1]), int(coord[0])]
-                        draw_pixel_goal = True
-
-                        # look down --> horizontal
-                        self.env.step(action_code.LOOKUP)
-                        self.env.step(action_code.LOOKUP)
-
-                        local_actions = []
-                        pixel_values = inputs.pixel_values
-                        image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
-
-                        with torch.no_grad():
-                            traj_latents = self.model.generate_latents(output_ids, pixel_values, image_grid_thw)
-
-                        # prepocess align with navdp
-                        image_dp = torch.tensor(np.array(look_down_image.resize((224, 224)))).to(torch.bfloat16) / 255
-                        pix_goal_image = copy.copy(image_dp)
-                        images_dp = torch.stack([pix_goal_image, image_dp]).unsqueeze(0).to(self.device)
-                        depth_dp = look_down_depth.unsqueeze(-1).to(torch.bfloat16)
-                        pix_goal_depth = copy.copy(depth_dp)
-                        depths_dp = torch.stack([pix_goal_depth, depth_dp]).unsqueeze(0).to(self.device)
-
-                        with torch.no_grad():
-                            dp_actions = self.model.generate_traj(traj_latents, images_dp, depths_dp)
-
-                        action_list = traj_to_actions(dp_actions)
-                        if len(action_list) < MAX_STEPS:
-                            action_list += [0] * (MAX_STEPS - len(action_list))
-
-                        local_actions = action_list
-                        if len(local_actions) >= MAX_LOCAL_STEPS:
-                            local_actions = local_actions[:MAX_LOCAL_STEPS]
-
-                        action = local_actions[0]
-                        if action == action_code.STOP:
+                        if self.disable_pixel_goal:
+                            action_seq = [action_code.FORWARD]
+                            print('step_id:', step_id, 'disable_pixel_goal -> fallback actions', action_seq)
+                            llm_outputs = "↑"
+                            print('actions', action_seq, flush=True)
                             pixel_goal = None
+                            draw_pixel_goal = False
                             output_ids = None
-                            action = action_code.LEFT
-                            observations, _, done, _ = self.env.step(action)
-                            step_id += 1
-                            messages = []
-                            continue
-                        print('predicted goal', pixel_goal, flush=True)
+                        else:
+                            forward_action = 0
+                            pixel_goal, reject_reason = self._parse_pixel_goal(llm_outputs, last_valid_pixel_goal)
+                            if pixel_goal is None:
+                                action_seq = [action_code.FORWARD]
+                                print('step_id:', step_id, 'pixel_goal_reject -> fallback actions', action_seq, reject_reason)
+                                llm_outputs = "↑"
+                                print('actions', action_seq, flush=True)
+                                draw_pixel_goal = False
+                                output_ids = None
+                            else:
+                                draw_pixel_goal = True
+                                last_valid_pixel_goal = list(pixel_goal)
+
+                            if pixel_goal is None:
+                                pass
+                            else:
+                                # look down --> horizontal
+                                self.env.step(action_code.LOOKUP)
+                                self.env.step(action_code.LOOKUP)
+
+                                local_actions = []
+                                pixel_values = inputs.pixel_values
+                                image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
+
+                                with torch.no_grad():
+                                    traj_latents = self.model.generate_latents(output_ids, pixel_values, image_grid_thw)
+
+                                # prepocess align with navdp
+                                image_dp = (
+                                    torch.tensor(np.array(look_down_image.resize((224, 224)))).to(torch.bfloat16) / 255
+                                )
+                                pix_goal_image = copy.copy(image_dp)
+                                images_dp = torch.stack([pix_goal_image, image_dp]).unsqueeze(0).to(self.device)
+                                depth_dp = look_down_depth.unsqueeze(-1).to(torch.bfloat16)
+                                pix_goal_depth = copy.copy(depth_dp)
+                                depths_dp = torch.stack([pix_goal_depth, depth_dp]).unsqueeze(0).to(self.device)
+
+                                with torch.no_grad():
+                                    dp_actions = self.model.generate_traj(traj_latents, images_dp, depths_dp)
+
+                                action_list = traj_to_actions(dp_actions)
+                                if len(action_list) < MAX_STEPS:
+                                    action_list += [0] * (MAX_STEPS - len(action_list))
+
+                                local_actions = action_list
+                                if len(local_actions) >= MAX_LOCAL_STEPS:
+                                    local_actions = local_actions[:MAX_LOCAL_STEPS]
+
+                                action = local_actions[0]
+                                if action == action_code.STOP:
+                                    pixel_goal = None
+                                    output_ids = None
+                                    action = action_code.LEFT
+                                    observations, _, done, _ = self.env.step(action)
+                                    step_id += 1
+                                    messages = []
+                                    continue
+                                print('predicted goal', pixel_goal, flush=True)
 
                     else:
                         action_seq = self.parse_actions(llm_outputs)
@@ -540,7 +610,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 print("step_id", step_id, "action", action)
 
                 if vis_writer is not None:
-                    vis = np.asarray(save_raw_image).copy()
+                    if info['top_down_map'] is not None:
+                        vis = observations_to_image({'rgb': np.asarray(save_raw_image)}, info)
+                    else:
+                        vis = np.asarray(save_raw_image).copy()
                     vis = cv2.putText(
                         vis,
                         f"step {step_id} action {int(action)}",
@@ -550,9 +623,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         (0, 255, 0),
                         2,
                     )
-                    if pixel_goal is not None:
-                        if draw_pixel_goal:
-                            cv2.circle(vis, (pixel_goal[0], pixel_goal[1]), radius=8, color=(255, 0, 0), thickness=-1)
+                    if pixel_goal is not None and draw_pixel_goal:
+                        cv2.circle(vis, (pixel_goal[0], pixel_goal[1]), radius=8, color=(255, 0, 0), thickness=-1)
                     vis_writer.append_data(vis)
 
                 if action == action_code.LOOKDOWN:
@@ -575,14 +647,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
             sucs.append(metrics['success'])
             spls.append(metrics['spl'])
-            oss.append(metrics['oracle_success'])
+            oss.append(metrics.get('oracle_success', 0.0))  # Use 0.0 if not available
             nes.append(metrics["distance_to_goal"])
             if 'ndtw' in metrics:
                 ndtw.append(metrics["ndtw"])
 
             print(
                 f"scene_episode {scene_id}_{episode_id:04d} success: {metrics['success']}, "
-                f"spl: {metrics['spl']}, os: {metrics['oracle_success']}, "
+                f"spl: {metrics['spl']}, os: {metrics.get('oracle_success', 0.0)}, "
                 f"ne: {metrics['distance_to_goal']}"
             )
 
@@ -592,7 +664,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "episode_id": episode_id,
                 "success": metrics["success"],
                 "spl": metrics["spl"],
-                "os": metrics['oracle_success'],
+                "os": metrics.get('oracle_success', 0.0),
                 "ne": metrics["distance_to_goal"],
                 "steps": step_id,
                 "episode_instruction": episode_instruction,
@@ -695,6 +767,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             goal = None
             action = None
             messages = []
+            last_valid_pixel_goal = None
 
             done = False
             flag = False
@@ -791,33 +864,53 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     print('step_id:', step_id, 'output text:', llm_outputs)
 
                     if bool(re.search(r'\d', llm_outputs)):  # output pixel goal
-                        forward_action = 0
-                        coord = [int(c) for c in re.findall(r'\d+', llm_outputs)]
-
-                        pixel_goal = [int(coord[1]), int(coord[0])]
-                        draw_pixel_goal = True
-
-                        # look down --> horizontal
-                        self.env.step(action_code.LOOKUP)
-                        self.env.step(action_code.LOOKUP)
-
-                        goal = pixel_to_gps(pixel_goal, depth / 1000, intrinsic_matrix, tf_camera_to_episodic)
-
-                        goal = (transformation_matrix @ np.array([-goal[1], 0, -goal[0], 1]))[:3]
-
-                        if not self.env._env.sim.pathfinder.is_navigable(np.array(goal)):
-                            goal = np.array(self.env._env.sim.pathfinder.snap_point(np.array(goal)))
-
-                        action = agent.get_next_action(goal)
-                        if action == action_code.STOP:
+                        if self.disable_pixel_goal:
+                            action_seq = [action_code.FORWARD]
+                            print('step_id:', step_id, 'disable_pixel_goal -> fallback actions', action_seq)
+                            llm_outputs = "↑"
+                            print('actions', action_seq, flush=True)
                             goal = None
+                            draw_pixel_goal = False
                             output_ids = None
-                            action = action_code.LEFT  # random action to avoid deadlock
-                            observations, _, done, _ = self.env.step(action)
-                            step_id += 1
-                            messages = []
-                            continue
-                        print('predicted goal', pixel_goal, goal, flush=True)
+                        else:
+                            forward_action = 0
+                            pixel_goal, reject_reason = self._parse_pixel_goal(llm_outputs, last_valid_pixel_goal)
+                            if pixel_goal is None:
+                                action_seq = [action_code.FORWARD]
+                                print('step_id:', step_id, 'pixel_goal_reject -> fallback actions', action_seq, reject_reason)
+                                llm_outputs = "↑"
+                                print('actions', action_seq, flush=True)
+                                goal = None
+                                draw_pixel_goal = False
+                                output_ids = None
+                            else:
+                                draw_pixel_goal = True
+                                last_valid_pixel_goal = list(pixel_goal)
+
+                            if pixel_goal is None:
+                                pass
+                            else:
+                                # look down --> horizontal
+                                self.env.step(action_code.LOOKUP)
+                                self.env.step(action_code.LOOKUP)
+
+                                goal = pixel_to_gps(pixel_goal, depth / 1000, intrinsic_matrix, tf_camera_to_episodic)
+
+                                goal = (transformation_matrix @ np.array([-goal[1], 0, -goal[0], 1]))[:3]
+
+                                if not self.env._env.sim.pathfinder.is_navigable(np.array(goal)):
+                                    goal = np.array(self.env._env.sim.pathfinder.snap_point(np.array(goal)))
+
+                                action = agent.get_next_action(goal)
+                                if action == action_code.STOP:
+                                    goal = None
+                                    output_ids = None
+                                    action = action_code.LEFT  # random action to avoid deadlock
+                                    observations, _, done, _ = self.env.step(action)
+                                    step_id += 1
+                                    messages = []
+                                    continue
+                                print('predicted goal', pixel_goal, goal, flush=True)
 
                     else:
                         action_seq = self.parse_actions(llm_outputs)
@@ -860,7 +953,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 print("step_id", step_id, "action", action)
 
                 if vis_writer is not None:
-                    vis = np.asarray(save_raw_image).copy()
+                    if info['top_down_map'] is not None:
+                        vis = observations_to_image({'rgb': np.asarray(save_raw_image)}, info)
+                    else:
+                        vis = np.asarray(save_raw_image).copy()
                     vis = cv2.putText(
                         vis,
                         f"step {step_id} action {int(action)}",
@@ -894,14 +990,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
             sucs.append(metrics['success'])
             spls.append(metrics['spl'])
-            oss.append(metrics['oracle_success'])
+            oss.append(metrics.get('oracle_success', 0.0))  # Use 0.0 if not available
             nes.append(metrics["distance_to_goal"])
             if 'ndtw' in metrics:
                 ndtw.append(metrics["ndtw"])
 
             print(
                 f"scene_episode {scene_id}_{episode_id:04d} success: {metrics['success']}, "
-                f"spl: {metrics['spl']}, os: {metrics['oracle_success']}, "
+                f"spl: {metrics['spl']}, os: {metrics.get('oracle_success', 0.0)}, "
                 f"ne: {metrics['distance_to_goal']}"
             )
 
@@ -911,7 +1007,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "episode_id": episode_id,
                 "success": metrics["success"],
                 "spl": metrics["spl"],
-                "os": metrics['oracle_success'],
+                "os": metrics.get('oracle_success', 0.0),
                 "ne": metrics["distance_to_goal"],
                 "steps": step_id,
                 "episode_instruction": episode_instruction,

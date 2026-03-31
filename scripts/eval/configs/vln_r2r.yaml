@@ -3,11 +3,14 @@
 defaults:
   - /habitat: habitat_config_base
   - /habitat/task: vln_r2r
-  - /habitat/simulator/agents@habitat.simulator.agents.main_agent: rgbd_agent
+  - /habitat/simulator/sensor_setups@habitat.simulator.agents.main_agent: rgbd_agent
   - /habitat/dataset/vln: mp3d_r2r
   - /habitat/task/lab_sensors:
     - gps_sensor
     - compass_sensor
+  - /habitat/task/actions:
+    - look_up
+    - look_down
   - _self_
 
 habitat:
@@ -32,8 +35,6 @@ habitat:
             max_depth: 10.0
     forward_step_size: 0.25
     turn_angle: 15
-    tilt_angle: 15
-    action_space_config: "v1"
     habitat_sim_v0:
       gpu_device_id: 0
   task:
@@ -50,28 +51,8 @@ habitat:
         type: OracleSuccess
       oracle_navigation_error:
         type: OracleNavigationError
-    actions:
-      stop:
-        type: StopAction
-        agent_index: 0
-      move_forward:
-        type: MoveForwardAction
-        agent_index: 0
-      turn_left:
-        type: TurnLeftAction
-        agent_index: 0
-      turn_right:
-        type: TurnRightAction
-        agent_index: 0
-      look_up:
-        type: LookUpAction
-        agent_index: 0
-      look_down:
-        type: LookDownAction
-        agent_index: 0
-
   dataset:
     type: R2RVLN-v1
     split: val_unseen
-    scenes_dir: data/scene_data/mp3d_ce
-    data_path: data/vln_ce/raw_data/r2r/{split}/{split}.json.gz
+    scenes_dir: /mnt/data/VL-LN-Bench/scene_datasets/
+    data_path: /mnt/data/0923_Interndata/vln_ce/raw_data/r2r/{split}/{split}.json.gz

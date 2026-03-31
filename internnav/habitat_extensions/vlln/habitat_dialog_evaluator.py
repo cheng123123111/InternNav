@@ -71,7 +71,7 @@ class HabitatDialogEvaluator(DistributedEvaluator):
                         draw_shortest_path=True,
                         draw_view_points=True,
                         draw_goal_positions=True,
-                        draw_goal_aabbs=True,
+                        draw_goal_aabbs=False,
                         fog_of_war=FogOfWarConfig(
                             draw=True,
                             visibility_dist=5.0,
@@ -103,6 +103,8 @@ class HabitatDialogEvaluator(DistributedEvaluator):
                     oss.append(res['os'])
                     nes.append(res['ne'])
         env = self.env
+        object_dict = None
+        region_dict = None
 
         while env.is_running:
             # ------------ 1. Start of an episode ------------
@@ -156,7 +158,7 @@ class HabitatDialogEvaluator(DistributedEvaluator):
             while not env._env.episode_over and step_id <= self.max_steps_per_episode:
                 # save frames
                 info = env.get_metrics()
-                if info['top_down_map'] is not None and self.save_video:
+                if self.save_video:
                     save_image = Image.fromarray(obs["rgb"]).convert('RGB')
                     frame = observations_to_image({'rgb': np.asarray(save_image)}, info)
                     vis_frames.append(frame)
@@ -180,7 +182,9 @@ class HabitatDialogEvaluator(DistributedEvaluator):
                     obs, reward, done, info = env.step(action)
                     continue
                 elif action == 6:
-                    if len(self.agent.dialogs) / 2 >= self.turn:
+                    if object_dict is None or region_dict is None:
+                        npc_answer = 'No oracle is available for this task.'
+                    elif len(self.agent.dialogs) / 2 >= self.turn:
                         npc_answer = 'Sorry, you have reached the question limit. No further answers are available.'
                     else:
                         path_description, pl = get_description(env._env, object_dict, region_dict)

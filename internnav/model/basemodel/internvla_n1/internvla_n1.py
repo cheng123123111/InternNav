@@ -238,6 +238,8 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                     bsz = cur_images.size(0)
                     images_dp = torch.stack([pix_goal_images, cur_images], dim=1).permute(0, 1, 4, 2, 3)
                     images_dp_norm = (images_dp - self._resnet_mean) / self._resnet_std
+                    rgb_dtype = next(self.get_model().rgb_model.parameters()).dtype
+                    images_dp_norm = images_dp_norm.to(dtype=rgb_dtype)
 
                     images_dp_feat = (
                         self.get_model()

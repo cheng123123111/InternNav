@@ -751,8 +751,10 @@ def clip_or_pad(arr, fixed_len):
 
 def get_annotations_from_lerobot_data(data_path, setting):
     from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    import pyarrow.parquet as pq
+    try:
+        import pyarrow.parquet as pq
+    except ImportError:
+        pq = None
 
     annotations = {
         "axis_align_matrix": [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
@@ -772,23 +774,33 @@ def get_annotations_from_lerobot_data(data_path, setting):
             parquet_path = os.path.join(
                 scene_path, "data", f"chunk-{ep_id // 1000:03d}", f"episode_{ep_id:06d}.parquet"
             )
+            json_path = parquet_path.replace(".parquet", ".json")
+            if pq is not None and os.path.exists(parquet_path):
+                table = pq.read_table(parquet_path)
+                df = table.to_pandas()
+                ep_actions = df["action"].tolist()
+                pose_key = f"pose.{setting}"
+                goal_key = f"goal.{setting}"
+                relative_goal_frame_id_key = f"relative_goal_frame_id.{setting}"
 
-            table = pq.read_table(parquet_path)
-            df = table.to_pandas()
-
-            ep_actions = df["action"].tolist()
-
-            pose_key = f"pose.{setting}"
-            goal_key = f"goal.{setting}"
-            relative_goal_frame_id_key = f"relative_goal_frame_id.{setting}"
-
-            if pose_key in df.columns and goal_key in df.columns and relative_goal_frame_id_key in df.columns:
-                ep_poses = df[pose_key].apply(lambda x: x.tolist()).tolist()
-                ep_pixel_goals = [
-                    [df[relative_goal_frame_id_key][idx].tolist(), df[goal_key][idx].tolist()] for idx in range(len(df))
-                ]
+                if pose_key in df.columns and goal_key in df.columns and relative_goal_frame_id_key in df.columns:
+                    ep_poses = df[pose_key].apply(lambda x: x.tolist()).tolist()
+                    ep_pixel_goals = [
+                        [df[relative_goal_frame_id_key][idx].tolist(), df[goal_key][idx].tolist()] for idx in range(len(df))
+                    ]
+                else:
+                    print(f"Warning: Missing data for setting {setting} in episode {ep_id}, filling with defaults.")
+                    continue
+            elif os.path.exists(json_path):
+                rows = json.load(open(json_path, "r"))
+                ep_actions = [row["action"] for row in rows]
+                pose_key = f"pose.{setting}"
+                goal_key = f"goal.{setting}"
+                relative_goal_frame_id_key = f"relative_goal_frame_id.{setting}"
+                ep_poses = [row[pose_key] for row in rows]
+                ep_pixel_goals = [[row[relative_goal_frame_id_key], row[goal_key]] for row in rows]
             else:
-                print(f"Warning: Missing data for setting {setting} in episode {ep_id}, filling with defaults.")
+                raise FileNotFoundError(f"Neither parquet nor json episode file exists for episode {ep_id}: {parquet_path}")
 
             assert len(ep_actions) == ep_len, f"Action length mismatch in episode {ep_id}"
 

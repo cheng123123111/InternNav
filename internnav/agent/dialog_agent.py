@@ -88,7 +88,7 @@ class DialogAgent(Agent):
             model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 self.model_args.model_path,
                 torch_dtype=torch.bfloat16,
-                attn_implementation="flash_attention_2",
+                attn_implementation="eager",
                 device_map={"": self.device},
             )
         else:

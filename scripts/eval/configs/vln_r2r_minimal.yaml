@@ -1,0 +1,19 @@
+# @package _global_
+# Minimal VLN-CE config - only override data paths
+
+defaults:
+  - /habitat: habitat_config_base
+  - /habitat/task: vln_r2r
+  - /habitat/dataset/vln: mp3d_r2r
+  - /habitat/task/lab_sensors:
+    - gps_sensor
+    - compass_sensor
+  - _self_
+
+habitat:
+  environment:
+    max_episode_steps: 1000
+  dataset:
+    scenes_dir: /mnt/data/VL-LN-Bench/scene_datasets/mp3d
+    data_path: /mnt/data/0923_Interndata/vln_ce/raw_data/r2r/{split}/{split}.json.gz
+    content_scenes: ["8194nk5LbLH"]
