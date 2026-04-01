@@ -326,7 +326,13 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         latent_queries = self.get_model().latent_queries.repeat(text_embeds.shape[0], 1, 1)
         image_idx = input_ids == IMAGE_TOKEN_INDEX
         N_QUERY = self.get_n_query()
-        input_ids = torch.cat([input_ids, torch.tensor([[TRAJ_TOKEN_INDEX] * N_QUERY]).to(input_ids.device)], dim=1)
+        traj_tokens = torch.full(
+            (input_ids.shape[0], N_QUERY),
+            TRAJ_TOKEN_INDEX,
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
+        input_ids = torch.cat([input_ids, traj_tokens], dim=1)
 
         pixel_values = pixel_values.type(self.visual.dtype)
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw).unsqueeze(0)
@@ -347,6 +353,26 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         hidden_states = outputs.hidden_states[-1][:, -N_QUERY:, :]
 
         return hidden_states
+
+    def extract_stop_features(self, input_ids, pixel_values, image_grid_thw):
+        traj_latents = self.generate_latents(input_ids, pixel_values, image_grid_thw)
+        return traj_latents.mean(dim=1)
+
+    def reset_stop_head(self):
+        stop_head = self.get_model().stop_head
+        with torch.no_grad():
+            stop_head[0].weight.fill_(1.0)
+            stop_head[0].bias.zero_()
+            nn.init.xavier_uniform_(stop_head[1].weight)
+            nn.init.zeros_(stop_head[1].bias)
+            nn.init.xavier_uniform_(stop_head[3].weight)
+            nn.init.zeros_(stop_head[3].bias)
+
+    def predict_should_stop(self, input_ids, pixel_values, image_grid_thw):
+        stop_features = self.extract_stop_features(input_ids, pixel_values, image_grid_thw)
+        stop_head_dtype = next(self.get_model().stop_head.parameters()).dtype
+        stop_logits = self.get_model().stop_head(stop_features.to(stop_head_dtype)).squeeze(-1)
+        return stop_logits
 
     def generate_traj(
         self,

@@ -112,6 +112,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self.disable_pixel_goal = bool(getattr(self.model_args, "disable_pixel_goal", False))
         self.pixel_goal_strict_parse = bool(getattr(self.model_args, "pixel_goal_strict_parse", False))
         self.pixel_goal_max_jump = float(getattr(self.model_args, "pixel_goal_max_jump", 0.0))
+        self.enable_stop_head = bool(getattr(self.model_args, "enable_stop_head", False))
+        self.stop_head_ckpt = getattr(self.model_args, "stop_head_ckpt", "")
+        self.stop_head_threshold = float(getattr(self.model_args, "stop_head_threshold", 0.5))
+        self.stop_head_reject_action = str(getattr(self.model_args, "stop_head_reject_action", "forward")).lower()
 
         processor = AutoProcessor.from_pretrained(self.model_args.model_path)
         processor.tokenizer.padding_side = 'left'
@@ -139,11 +143,21 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
         self.model = model
         self.processor = processor
+        if self.enable_stop_head and self.model_args.mode == 'dual_system' and self.stop_head_ckpt:
+            stop_state = torch.load(self.stop_head_ckpt, map_location="cpu")
+            if "stop_head" in stop_state:
+                stop_state = stop_state["stop_head"]
+            self.model.get_model().stop_head.load_state_dict(stop_state, strict=True)
+            print(f"loaded stop_head checkpoint from {self.stop_head_ckpt}")
 
         # refactor: this part used in three places
         prompt = "You are an autonomous navigation assistant. Your task is to <instruction>. Where should you go next to stay on track? Please output the next waypoint\'s coordinates in the image. Please output STOP when you have successfully completed the task."
         answer = ""
         self.conversation = [{"from": "human", "value": prompt}, {"from": "gpt", "value": answer}]
+        self.stop_prompt = (
+            "You are an autonomous navigation assistant. Your task is to <instruction>. "
+            "Judge whether the current view already matches the final stopping location of the task."
+        )
 
         self.conjunctions = [
             'you can see ',
@@ -288,6 +302,23 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 return None, f"jump_reject jump={jump:.1f} last={last_pixel_goal} now={pixel_goal}"
 
         return pixel_goal, None
+
+    def _stop_reject_fallback(self) -> int:
+        if self.stop_head_reject_action == "left":
+            return action_code.LEFT
+        if self.stop_head_reject_action == "right":
+            return action_code.RIGHT
+        return action_code.FORWARD
+
+    def _should_accept_stop(self, instruction: str, image: Image.Image) -> tuple[bool, float]:
+        stop_text = self.stop_prompt.replace("<instruction>", instruction)
+        messages = [{"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": stop_text}]}]
+        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = self.processor(text=[text], images=[image], return_tensors="pt").to(self.model.device)
+        image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
+        stop_logits = self.model.predict_should_stop(inputs.input_ids, inputs.pixel_values, image_grid_thw)
+        stop_prob = float(torch.sigmoid(stop_logits)[0].item())
+        return stop_prob >= self.stop_head_threshold, stop_prob
 
     def resume_from_output_path(self) -> None:
         sucs, spls, oss, nes, ndtw = [], [], [], [], []
@@ -549,6 +580,23 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                     else:
                         action_seq = self.parse_actions(llm_outputs)
+                        if (
+                            self.enable_stop_head
+                            and self.model_args.mode == 'dual_system'
+                            and len(action_seq) != 0
+                            and action_seq[0] == action_code.STOP
+                        ):
+                            accept_stop, stop_prob = self._should_accept_stop(episode_instruction, save_raw_image)
+                            print(
+                                f"step_id: {step_id} stop_head prob={stop_prob:.4f} "
+                                f"threshold={self.stop_head_threshold:.4f} accept={accept_stop}",
+                                flush=True,
+                            )
+                            if not accept_stop:
+                                action_seq = [self._stop_reject_fallback()]
+                                llm_outputs = "↑" if action_seq[0] == action_code.FORWARD else (
+                                    "←" if action_seq[0] == action_code.LEFT else "→"
+                                )
                         print('actions', action_seq, flush=True)
 
                 if len(action_seq) != 0:
@@ -914,6 +962,23 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                     else:
                         action_seq = self.parse_actions(llm_outputs)
+                        if (
+                            self.enable_stop_head
+                            and self.model_args.mode == 'dual_system'
+                            and len(action_seq) != 0
+                            and action_seq[0] == action_code.STOP
+                        ):
+                            accept_stop, stop_prob = self._should_accept_stop(episode_instruction, save_raw_image)
+                            print(
+                                f"step_id: {step_id} stop_head prob={stop_prob:.4f} "
+                                f"threshold={self.stop_head_threshold:.4f} accept={accept_stop}",
+                                flush=True,
+                            )
+                            if not accept_stop:
+                                action_seq = [self._stop_reject_fallback()]
+                                llm_outputs = "↑" if action_seq[0] == action_code.FORWARD else (
+                                    "←" if action_seq[0] == action_code.LEFT else "→"
+                                )
                         print('actions', action_seq, flush=True)
 
                 if len(action_seq) != 0:

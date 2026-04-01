@@ -119,8 +119,26 @@ class QFormer(nn.Module):
 
 
 class InternVLAN1MetaModel:
+    def _build_stop_head(self, hidden_size):
+        stop_hidden = max(256, hidden_size // 4)
+        stop_head = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, stop_hidden),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(stop_hidden, 1),
+        )
+        with torch.no_grad():
+            stop_head[0].weight.fill_(1.0)
+            stop_head[0].bias.zero_()
+            nn.init.xavier_uniform_(stop_head[1].weight)
+            nn.init.zeros_(stop_head[1].bias)
+            nn.init.xavier_uniform_(stop_head[3].weight)
+            nn.init.zeros_(stop_head[3].bias)
+        return stop_head
+
     def __init__(self, config):
         super(InternVLAN1MetaModel, self).__init__(config)
+        self.stop_head = self._build_stop_head(config.hidden_size)
         if hasattr(config, "system1"):
             self.latent_queries = nn.Parameter(torch.randn(1, config.n_query, config.hidden_size))
 
@@ -145,6 +163,8 @@ class InternVLAN1MetaModel:
                 raise NotImplementedError
 
     def initialize_vision_modules(self, model_args):
+        if getattr(self, 'stop_head', None) is None:
+            self.stop_head = self._build_stop_head(self.config.hidden_size)
         if 'nextdit' in model_args.system1:
             self.traj_dit, self.noise_scheduler = build_traj_dit(model_args)
             self.action_encoder = nn.Linear(3, 384, bias=True)
