@@ -18,6 +18,7 @@ import imageio
 import numpy as np
 import quaternion
 import torch
+import torch.nn.functional as F
 import tqdm
 from depth_camera_filtering import filter_depth
 from habitat.config.default import get_agent_config
@@ -42,7 +43,13 @@ from internnav.habitat_extensions.vln.utils import (
     xyz_yaw_pitch_to_tf_matrix,
 )
 from internnav.model.basemodel.internvla_n1.internvla_n1 import InternVLAN1ForCausalLM
+from internnav.model.basemodel.LongCLIP.model import longclip
 from internnav.model.utils.vln_utils import split_and_clean, traj_to_actions
+from scripts.data_collect.stop_alignment_utils import (
+    extract_stop_object_phrase,
+    extract_stop_phrase,
+    is_usable_stop_object_phrase,
+)
 
 # Import for Habitat registry side effects — do not remove
 import internnav.habitat_extensions.vln.measures  # noqa: F401 # isort: skip
@@ -112,6 +119,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self.disable_pixel_goal = bool(getattr(self.model_args, "disable_pixel_goal", False))
         self.pixel_goal_strict_parse = bool(getattr(self.model_args, "pixel_goal_strict_parse", False))
         self.pixel_goal_max_jump = float(getattr(self.model_args, "pixel_goal_max_jump", 0.0))
+        self.enable_qwen_stop_verify = bool(getattr(self.model_args, "enable_qwen_stop_verify", False))
+        self.qwen_stop_verify_max_new_tokens = int(getattr(self.model_args, "qwen_stop_verify_max_new_tokens", 8))
+        self.qwen_stop_reject_action = str(getattr(self.model_args, "qwen_stop_reject_action", "lookdown")).lower()
+        self.enable_longclip_stop_verify = bool(getattr(self.model_args, "enable_longclip_stop_verify", False))
+        self.longclip_stop_model_path = getattr(self.model_args, "longclip_stop_model_path", "")
+        self.longclip_stop_weight_path = getattr(self.model_args, "longclip_stop_weight_path", "")
+        self.longclip_stop_threshold = float(getattr(self.model_args, "longclip_stop_threshold", 0.1))
 
         processor = AutoProcessor.from_pretrained(self.model_args.model_path)
         processor.tokenizer.padding_side = 'left'
@@ -139,11 +153,47 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
         self.model = model
         self.processor = processor
+        self.longclip_model = None
+        self.longclip_preprocess = None
+        self.longclip_projector = None
+
+        if self.enable_longclip_stop_verify:
+            self.longclip_model, self.longclip_preprocess = longclip.load(self.longclip_stop_model_path, device=device)
+            ckpt = torch.load(self.longclip_stop_weight_path, map_location="cpu")
+            proj_dim = int(ckpt["proj_dim"])
+            feature_dim = int(self.longclip_model.text_projection.shape[-1])
+            self.longclip_projector = {
+                "image_proj.weight": ckpt["projector"]["image_proj.weight"].to(device),
+                "image_proj.bias": ckpt["projector"]["image_proj.bias"].to(device),
+                "text_proj.weight": ckpt["projector"]["text_proj.weight"].to(device),
+                "text_proj.bias": ckpt["projector"]["text_proj.bias"].to(device),
+                "logit_scale": ckpt["projector"]["logit_scale"].to(device),
+                "feature_dim": feature_dim,
+                "proj_dim": proj_dim,
+            }
+            self.longclip_model.eval()
 
         # refactor: this part used in three places
         prompt = "You are an autonomous navigation assistant. Your task is to <instruction>. Where should you go next to stay on track? Please output the next waypoint\'s coordinates in the image. Please output STOP when you have successfully completed the task."
         answer = ""
         self.conversation = [{"from": "human", "value": prompt}, {"from": "gpt", "value": answer}]
+        self.stop_verify_prompt = (
+            "You are a binary stop verifier, not a navigation planner.\n"
+            "Instruction: <instruction>\n"
+            "Use only the current view to decide whether the final stopping condition in the instruction is already satisfied.\n"
+            "Focus only on the final landmark/object and the required relative position, such as stop by, stop near, stop at, stop in front of, stop beside, stop under, or stop at the doorway.\n"
+            "If the final stopping condition is clearly satisfied, answer YES.\n"
+            "If the final stopping condition is not satisfied or you are uncertain, answer NO.\n"
+            "Do not output arrows, coordinates, actions, explanations, or any extra words.\n"
+            "The only valid answers are exactly YES or NO."
+        )
+        self.pixel_recover_prompt = (
+            "You are recovering navigation after a rejected STOP.\n"
+            "Instruction: <instruction>\n"
+            "Use only the current look-down view and output the next waypoint coordinates in the image.\n"
+            "Output exactly two integers for the waypoint coordinates and nothing else.\n"
+            "Do not output STOP, arrows, actions, explanations, or any extra words."
+        )
 
         self.conjunctions = [
             'you can see ',
@@ -247,6 +297,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
     def _run_vlm_text(self, prompt: str, images: list, max_new_tokens: int = 16) -> str:
         messages = [{"role": "user", "content": []}]
+        if images and DEFAULT_IMAGE_TOKEN not in prompt:
+            prompt = f"{DEFAULT_IMAGE_TOKEN}\n{prompt}"
         parts = split_and_clean(prompt)
         input_img_id = 0
         for part in parts:
@@ -269,6 +321,40 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             ).sequences
         return self.processor.tokenizer.decode(output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True).strip()
 
+    def _score_vlm_choices(self, prompt: str, images: list, choices: list[str]) -> list[float]:
+        messages = [{"role": "user", "content": []}]
+        if images and DEFAULT_IMAGE_TOKEN not in prompt:
+            prompt = f"{DEFAULT_IMAGE_TOKEN}\n{prompt}"
+        parts = split_and_clean(prompt)
+        input_img_id = 0
+        for part in parts:
+            if part == DEFAULT_IMAGE_TOKEN:
+                messages[0]["content"].append({"type": "image", "image": images[input_img_id]})
+                input_img_id += 1
+            else:
+                messages[0]["content"].append({"type": "text", "text": part})
+
+        prompt_text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        prompt_inputs = self.processor(text=[prompt_text], images=images, return_tensors="pt").to(self.model.device)
+        prompt_len = int(prompt_inputs.input_ids.shape[1])
+
+        scores = []
+        with torch.no_grad():
+            for choice in choices:
+                choice_text = prompt_text + choice
+                choice_inputs = self.processor(text=[choice_text], images=images, return_tensors="pt").to(self.model.device)
+                logits = self.model(**choice_inputs).logits[:, :-1, :]
+                labels = choice_inputs.input_ids[:, 1:]
+                choice_token_count = int(choice_inputs.input_ids.shape[1] - prompt_len)
+                if choice_token_count <= 0:
+                    scores.append(float("-inf"))
+                    continue
+                choice_logits = logits[:, prompt_len - 1 :, :]
+                choice_labels = labels[:, prompt_len - 1 :]
+                token_log_probs = F.log_softmax(choice_logits, dim=-1).gather(-1, choice_labels.unsqueeze(-1)).squeeze(-1)
+                scores.append(float(token_log_probs.sum().item()))
+        return scores
+
     def _parse_pixel_goal(
         self, llm_outputs: str, last_pixel_goal: Optional[list] = None
     ) -> tuple[Optional[list], Optional[str]]:
@@ -288,6 +374,51 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 return None, f"jump_reject jump={jump:.1f} last={last_pixel_goal} now={pixel_goal}"
 
         return pixel_goal, None
+
+    def _stop_reject_action_code(self) -> int:
+        mapping = {
+            "lookdown": action_code.LOOKDOWN,
+            "forward": action_code.FORWARD,
+            "left": action_code.LEFT,
+            "right": action_code.RIGHT,
+        }
+        return int(mapping.get(self.qwen_stop_reject_action, action_code.LOOKDOWN))
+
+    def _verify_stop_with_qwen(self, instruction: str, image: Image.Image) -> tuple[bool, str]:
+        prompt = self.stop_verify_prompt.replace("<instruction>", instruction)
+        choices = [" YES", " NO"]
+        scores = self._score_vlm_choices(prompt, [image], choices)
+        best_idx = int(np.argmax(scores))
+        answer = choices[best_idx].strip()
+        return best_idx == 0, f"{answer} scores={scores}"
+
+    def _longclip_project(self, feats: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+        return F.linear(feats, weight, bias)
+
+    def _verify_stop_with_longclip(self, instruction: str, image: Image.Image) -> tuple[bool, str]:
+        stop_object_phrase = extract_stop_object_phrase(instruction)
+        stop_phrase = extract_stop_phrase(instruction)
+        text = stop_object_phrase if is_usable_stop_object_phrase(stop_object_phrase) else stop_phrase
+        image_tensor = self.longclip_preprocess(image).unsqueeze(0).to(self.device)
+        text_tokens = longclip.tokenize([text], truncate=True).to(self.device)
+        with torch.no_grad():
+            image_features = self.longclip_model.encode_image(image_tensor).float()
+            text_features = self.longclip_model.encode_text(text_tokens).float()
+            image_features = self._longclip_project(
+                image_features,
+                self.longclip_projector["image_proj.weight"],
+                self.longclip_projector["image_proj.bias"],
+            )
+            text_features = self._longclip_project(
+                text_features,
+                self.longclip_projector["text_proj.weight"],
+                self.longclip_projector["text_proj.bias"],
+            )
+            image_features = F.normalize(image_features, dim=-1)
+            text_features = F.normalize(text_features, dim=-1)
+            score = float((image_features * text_features).sum(dim=-1).item())
+        answer = f"score={score:.4f} threshold={self.longclip_stop_threshold:.4f} text={text!r}"
+        return score >= self.longclip_stop_threshold, answer
 
     def resume_from_output_path(self) -> None:
         sucs, spls, oss, nes, ndtw = [], [], [], [], []
@@ -358,6 +489,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             llm_outputs = ""
             action = None
             messages = []
+            force_fresh_lookdown_prompt = False
+            force_pixel_only_once = False
+            block_action_branch_once = False
             local_actions = []
 
             done = False
@@ -418,13 +552,25 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                 if len(action_seq) == 0 and pixel_goal is None:
                     if action == action_code.LOOKDOWN:
-                        # last action is look down
-                        sources = [{"from": "human", "value": ""}, {"from": "gpt", "value": ""}]
-                        input_images += [look_down_image]
-                        messages.append(
-                            {'role': 'assistant', 'content': [{'type': 'text', 'text': llm_outputs}]}  # noqa: F405
-                        )
-                        input_img_id = -1
+                        if force_fresh_lookdown_prompt:
+                            sources = [{"from": "human", "value": self.pixel_recover_prompt}]
+                            sources[0]["value"] = sources[0]["value"].replace(
+                                "<instruction>", episode.instruction.instruction_text
+                            )
+                            input_images = [look_down_image]
+                            messages = []
+                            input_img_id = 0
+                            force_fresh_lookdown_prompt = False
+                            force_pixel_only_once = True
+                            block_action_branch_once = True
+                        else:
+                            # last action is look down
+                            sources = [{"from": "human", "value": ""}, {"from": "gpt", "value": ""}]
+                            input_images += [look_down_image]
+                            messages.append(
+                                {'role': 'assistant', 'content': [{'type': 'text', 'text': llm_outputs}]}  # noqa: F405
+                            )
+                            input_img_id = -1
                     else:
                         sources = copy.deepcopy(self.conversation)
                         sources[0]["value"] = sources[0]["value"].replace(
@@ -476,6 +622,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     llm_outputs = self.processor.tokenizer.decode(
                         output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
                     )
+                    if force_pixel_only_once and not bool(re.search(r'\d', llm_outputs)):
+                        retry_prompt = self.pixel_recover_prompt.replace("<instruction>", episode.instruction.instruction_text)
+                        llm_outputs = self._run_vlm_text(retry_prompt, [look_down_image], max_new_tokens=16)
+                        force_pixel_only_once = False
+                        print('step_id:', step_id, 'pixel_recover_retry output text:', llm_outputs)
                     print('step_id:', step_id, 'output text:', llm_outputs)
 
                     if bool(re.search(r'\d', llm_outputs)):  # output pixel goal
@@ -491,15 +642,27 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             forward_action = 0
                             pixel_goal, reject_reason = self._parse_pixel_goal(llm_outputs, last_valid_pixel_goal)
                             if pixel_goal is None:
-                                action_seq = [action_code.FORWARD]
-                                print('step_id:', step_id, 'pixel_goal_reject -> fallback actions', action_seq, reject_reason)
-                                llm_outputs = "↑"
-                                print('actions', action_seq, flush=True)
-                                draw_pixel_goal = False
-                                output_ids = None
+                                if block_action_branch_once and last_valid_pixel_goal is not None:
+                                    pixel_goal = list(last_valid_pixel_goal)
+                                    draw_pixel_goal = True
+                                    print(
+                                        'step_id:',
+                                        step_id,
+                                        'pixel_goal_reject -> reuse_last_valid_pixel_goal',
+                                        pixel_goal,
+                                        reject_reason,
+                                    )
+                                else:
+                                    action_seq = [action_code.LOOKDOWN] if block_action_branch_once else [action_code.FORWARD]
+                                    print('step_id:', step_id, 'pixel_goal_reject -> fallback actions', action_seq, reject_reason)
+                                    llm_outputs = "↓" if action_seq[0] == action_code.LOOKDOWN else "↑"
+                                    print('actions', action_seq, flush=True)
+                                    draw_pixel_goal = False
+                                    output_ids = None
                             else:
                                 draw_pixel_goal = True
                                 last_valid_pixel_goal = list(pixel_goal)
+                            block_action_branch_once = False
 
                             if pixel_goal is None:
                                 pass
@@ -548,7 +711,94 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 print('predicted goal', pixel_goal, flush=True)
 
                     else:
+                        if block_action_branch_once:
+                            if last_valid_pixel_goal is not None:
+                                pixel_goal = list(last_valid_pixel_goal)
+                                draw_pixel_goal = True
+                                block_action_branch_once = False
+                                print(
+                                    'step_id:',
+                                    step_id,
+                                    'recover_non_digit -> reuse_last_valid_pixel_goal',
+                                    pixel_goal,
+                                    flush=True,
+                                )
+                                # look down --> horizontal
+                                self.env.step(action_code.LOOKUP)
+                                self.env.step(action_code.LOOKUP)
+
+                                local_actions = []
+                                pixel_values = inputs.pixel_values
+                                image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
+
+                                with torch.no_grad():
+                                    traj_latents = self.model.generate_latents(output_ids, pixel_values, image_grid_thw)
+
+                                image_dp = (
+                                    torch.tensor(np.array(look_down_image.resize((224, 224)))).to(torch.bfloat16) / 255
+                                )
+                                pix_goal_image = copy.copy(image_dp)
+                                images_dp = torch.stack([pix_goal_image, image_dp]).unsqueeze(0).to(self.device)
+                                depth_dp = look_down_depth.unsqueeze(-1).to(torch.bfloat16)
+                                pix_goal_depth = copy.copy(depth_dp)
+                                depths_dp = torch.stack([pix_goal_depth, depth_dp]).unsqueeze(0).to(self.device)
+
+                                with torch.no_grad():
+                                    dp_actions = self.model.generate_traj(traj_latents, images_dp, depths_dp)
+
+                                action_list = traj_to_actions(dp_actions)
+                                if len(action_list) < MAX_STEPS:
+                                    action_list += [0] * (MAX_STEPS - len(action_list))
+
+                                local_actions = action_list
+                                if len(local_actions) >= MAX_LOCAL_STEPS:
+                                    local_actions = local_actions[:MAX_LOCAL_STEPS]
+
+                                action = local_actions[0]
+                                if action == action_code.STOP:
+                                    pixel_goal = None
+                                    output_ids = None
+                                    action = action_code.LEFT
+                                    observations, _, done, _ = self.env.step(action)
+                                    step_id += 1
+                                    messages = []
+                                    continue
+                                print('predicted goal', pixel_goal, flush=True)
+                            else:
+                                action_seq = [action_code.LOOKDOWN]
+                                block_action_branch_once = False
+                                print('step_id:', step_id, 'recover_non_digit -> force lookdown retry', flush=True)
+                                print('actions', action_seq, flush=True)
+                                continue
                         action_seq = self.parse_actions(llm_outputs)
+                        if len(action_seq) != 0 and action_seq[0] == action_code.STOP and (
+                            self.enable_qwen_stop_verify or self.enable_longclip_stop_verify
+                        ):
+                            if self.enable_longclip_stop_verify:
+                                stop_accept, stop_answer = self._verify_stop_with_longclip(
+                                    episode_instruction,
+                                    save_raw_image,
+                                )
+                                stop_tag = "longclip_stop_verify"
+                            else:
+                                stop_accept, stop_answer = self._verify_stop_with_qwen(
+                                    episode_instruction,
+                                    save_raw_image,
+                                )
+                                stop_tag = "stop_verify"
+                            print(
+                                f"{stop_tag} step={step_id} answer={stop_answer!r} accept={stop_accept}",
+                                flush=True,
+                            )
+                            if not stop_accept:
+                                action_seq = [self._stop_reject_action_code()]
+                                llm_outputs = "↓" if action_seq[0] == action_code.LOOKDOWN else llm_outputs
+                                pixel_goal = None
+                                output_ids = None
+                                input_images = []
+                                messages = []
+                                force_fresh_lookdown_prompt = action_seq[0] == action_code.LOOKDOWN
+                                force_pixel_only_once = force_fresh_lookdown_prompt
                         print('actions', action_seq, flush=True)
 
                 if len(action_seq) != 0:
