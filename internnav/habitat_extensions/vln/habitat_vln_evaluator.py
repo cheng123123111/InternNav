@@ -46,6 +46,7 @@ from internnav.model.basemodel.internvla_n1.internvla_n1 import InternVLAN1ForCa
 from internnav.model.basemodel.LongCLIP.model import longclip
 from internnav.model.utils.vln_utils import split_and_clean, traj_to_actions
 from scripts.data_collect.stop_alignment_utils import (
+    extract_stop_target_elements,
     extract_stop_object_phrase,
     extract_stop_phrase,
     is_usable_stop_object_phrase,
@@ -85,7 +86,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self.agent_config = get_agent_config(self.config.habitat.simulator)
         self.sim_sensors_config = self.config.habitat.simulator.agents.main_agent.sim_sensors
 
+        requested_local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        gpu_count = max(torch.cuda.device_count(), 1)
+        requested_device_id = requested_local_rank % gpu_count
+
         with habitat.config.read_write(self.config):
+            self.config.habitat.simulator.habitat_sim_v0.gpu_device_id = requested_device_id
             self.config.habitat.task.measurements.update(
                 {
                     "top_down_map": TopDownMapMeasurementConfig(
@@ -130,19 +136,20 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         processor = AutoProcessor.from_pretrained(self.model_args.model_path)
         processor.tokenizer.padding_side = 'left'
 
-        device = torch.device(f"cuda:{self.local_rank}")
+        device_id = self.local_rank % gpu_count
+        device = torch.device(f"cuda:{device_id}")
         if self.model_args.mode == 'dual_system':
             model = InternVLAN1ForCausalLM.from_pretrained(
                 self.model_args.model_path,
                 torch_dtype=torch.bfloat16,
-                attn_implementation="eager",  # Changed from flash_attention_2
+                attn_implementation="flash_attention_2",
                 device_map={"": device},
             )
         elif self.model_args.mode == 'system2':
             model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 self.model_args.model_path,
                 torch_dtype=torch.bfloat16,
-                attn_implementation="eager",  # Changed from flash_attention_2
+                attn_implementation="flash_attention_2",
                 device_map={"": device},
             )
         else:
@@ -156,21 +163,39 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self.longclip_model = None
         self.longclip_preprocess = None
         self.longclip_projector = None
+        self.longclip_head = None
+        self.longclip_mode = "projector"
 
         if self.enable_longclip_stop_verify:
             self.longclip_model, self.longclip_preprocess = longclip.load(self.longclip_stop_model_path, device=device)
             ckpt = torch.load(self.longclip_stop_weight_path, map_location="cpu")
-            proj_dim = int(ckpt["proj_dim"])
             feature_dim = int(self.longclip_model.text_projection.shape[-1])
-            self.longclip_projector = {
-                "image_proj.weight": ckpt["projector"]["image_proj.weight"].to(device),
-                "image_proj.bias": ckpt["projector"]["image_proj.bias"].to(device),
-                "text_proj.weight": ckpt["projector"]["text_proj.weight"].to(device),
-                "text_proj.bias": ckpt["projector"]["text_proj.bias"].to(device),
-                "logit_scale": ckpt["projector"]["logit_scale"].to(device),
-                "feature_dim": feature_dim,
-                "proj_dim": proj_dim,
-            }
+            if "head" in ckpt:
+                self.longclip_mode = "elements"
+                self.longclip_head = {
+                    "image_proj.weight": ckpt["head"]["image_proj.weight"].to(device),
+                    "image_proj.bias": ckpt["head"]["image_proj.bias"].to(device),
+                    "text_proj.weight": ckpt["head"]["text_proj.weight"].to(device),
+                    "text_proj.bias": ckpt["head"]["text_proj.bias"].to(device),
+                    "score_head.0.weight": ckpt["head"]["score_head.0.weight"].to(device),
+                    "score_head.0.bias": ckpt["head"]["score_head.0.bias"].to(device),
+                    "score_head.2.weight": ckpt["head"]["score_head.2.weight"].to(device),
+                    "score_head.2.bias": ckpt["head"]["score_head.2.bias"].to(device),
+                    "obj_threshold": float(ckpt.get("obj_threshold", 0.25)),
+                    "coverage_temperature": float(ckpt.get("coverage_temperature", 12.0)),
+                    "max_target_elements": int(ckpt.get("max_target_elements", 4)),
+                }
+            else:
+                proj_dim = int(ckpt["proj_dim"])
+                self.longclip_projector = {
+                    "image_proj.weight": ckpt["projector"]["image_proj.weight"].to(device),
+                    "image_proj.bias": ckpt["projector"]["image_proj.bias"].to(device),
+                    "text_proj.weight": ckpt["projector"]["text_proj.weight"].to(device),
+                    "text_proj.bias": ckpt["projector"]["text_proj.bias"].to(device),
+                    "logit_scale": ckpt["projector"]["logit_scale"].to(device),
+                    "feature_dim": feature_dim,
+                    "proj_dim": proj_dim,
+                }
             self.longclip_model.eval()
 
         # refactor: this part used in three places
@@ -395,29 +420,82 @@ class HabitatVLNEvaluator(DistributedEvaluator):
     def _longclip_project(self, feats: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
         return F.linear(feats, weight, bias)
 
+    def _longclip_score_head(self, stats: torch.Tensor) -> torch.Tensor:
+        hidden = F.linear(
+            stats,
+            self.longclip_head["score_head.0.weight"],
+            self.longclip_head["score_head.0.bias"],
+        )
+        hidden = F.gelu(hidden)
+        return F.linear(
+            hidden,
+            self.longclip_head["score_head.2.weight"],
+            self.longclip_head["score_head.2.bias"],
+        ).squeeze(-1)
+
     def _verify_stop_with_longclip(self, instruction: str, image: Image.Image) -> tuple[bool, str]:
-        stop_object_phrase = extract_stop_object_phrase(instruction)
-        stop_phrase = extract_stop_phrase(instruction)
-        text = stop_object_phrase if is_usable_stop_object_phrase(stop_object_phrase) else stop_phrase
         image_tensor = self.longclip_preprocess(image).unsqueeze(0).to(self.device)
-        text_tokens = longclip.tokenize([text], truncate=True).to(self.device)
         with torch.no_grad():
             image_features = self.longclip_model.encode_image(image_tensor).float()
-            text_features = self.longclip_model.encode_text(text_tokens).float()
-            image_features = self._longclip_project(
-                image_features,
-                self.longclip_projector["image_proj.weight"],
-                self.longclip_projector["image_proj.bias"],
-            )
-            text_features = self._longclip_project(
-                text_features,
-                self.longclip_projector["text_proj.weight"],
-                self.longclip_projector["text_proj.bias"],
-            )
-            image_features = F.normalize(image_features, dim=-1)
-            text_features = F.normalize(text_features, dim=-1)
-            score = float((image_features * text_features).sum(dim=-1).item())
-        answer = f"score={score:.4f} threshold={self.longclip_stop_threshold:.4f} text={text!r}"
+            if self.longclip_mode == "elements":
+                elements = extract_stop_target_elements(
+                    instruction,
+                    max_elements=self.longclip_head["max_target_elements"],
+                )
+                if not elements:
+                    stop_object_phrase = extract_stop_object_phrase(instruction)
+                    stop_phrase = extract_stop_phrase(instruction)
+                    text = stop_object_phrase if is_usable_stop_object_phrase(stop_object_phrase) else stop_phrase
+                    elements = [text]
+                text_tokens = longclip.tokenize(elements, truncate=True).to(self.device)
+                text_features = self.longclip_model.encode_text(text_tokens).float()
+                image_proj = self._longclip_project(
+                    image_features,
+                    self.longclip_head["image_proj.weight"],
+                    self.longclip_head["image_proj.bias"],
+                )
+                text_proj = self._longclip_project(
+                    text_features,
+                    self.longclip_head["text_proj.weight"],
+                    self.longclip_head["text_proj.bias"],
+                )
+                image_proj = F.normalize(image_proj, dim=-1)
+                text_proj = F.normalize(text_proj, dim=-1)
+                sims = (image_proj * text_proj).sum(dim=-1)
+                soft_coverage = torch.sigmoid(
+                    (sims - self.longclip_head["obj_threshold"]) * self.longclip_head["coverage_temperature"]
+                ).mean()
+                count_ratio = torch.tensor(
+                    len(elements) / max(self.longclip_head["max_target_elements"], 1),
+                    device=self.device,
+                    dtype=sims.dtype,
+                )
+                stats = torch.stack([sims.mean(), sims.max(), soft_coverage, count_ratio], dim=0).unsqueeze(0)
+                score = float(self._longclip_score_head(stats).item())
+                answer = (
+                    f"score={score:.4f} threshold={self.longclip_stop_threshold:.4f} "
+                    f"elements={elements!r} sims={[round(float(x), 4) for x in sims.tolist()]}"
+                )
+            else:
+                stop_object_phrase = extract_stop_object_phrase(instruction)
+                stop_phrase = extract_stop_phrase(instruction)
+                text = stop_object_phrase if is_usable_stop_object_phrase(stop_object_phrase) else stop_phrase
+                text_tokens = longclip.tokenize([text], truncate=True).to(self.device)
+                text_features = self.longclip_model.encode_text(text_tokens).float()
+                image_features = self._longclip_project(
+                    image_features,
+                    self.longclip_projector["image_proj.weight"],
+                    self.longclip_projector["image_proj.bias"],
+                )
+                text_features = self._longclip_project(
+                    text_features,
+                    self.longclip_projector["text_proj.weight"],
+                    self.longclip_projector["text_proj.bias"],
+                )
+                image_features = F.normalize(image_features, dim=-1)
+                text_features = F.normalize(text_features, dim=-1)
+                score = float((image_features * text_features).sum(dim=-1).item())
+                answer = f"score={score:.4f} threshold={self.longclip_stop_threshold:.4f} text={text!r}"
         return score >= self.longclip_stop_threshold, answer
 
     def resume_from_output_path(self) -> None:
@@ -927,11 +1005,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             with open(os.path.join(self.output_path, 'progress.json'), 'a') as f:
                 f.write(json.dumps(result) + "\n")
 
-            # save video
-            if self.save_video and metrics['success'] == 1.0:
+            # save video for both successful and failed episodes in separate directories
+            if self.save_video:
+                video_bucket = 'success' if metrics['success'] == 1.0 else 'failed'
                 images_to_video(
                     vis_frames,
-                    os.path.join(self.output_path, f'vis_{self.epoch}', f'{scene_id}'),
+                    os.path.join(self.output_path, f'vis_{self.epoch}', video_bucket, f'{scene_id}'),
                     f'{episode_id:04d}',
                     fps=6,
                     quality=9,
@@ -1268,10 +1347,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             os.makedirs(self.output_path, exist_ok=True)
             with open(os.path.join(self.output_path, 'progress.json'), 'a') as f:
                 f.write(json.dumps(result) + "\n")
-            if self.save_video and metrics['success'] == 1.0:
+            # save video for both successful and failed episodes in separate directories
+            if self.save_video:
+                video_bucket = 'success' if metrics['success'] == 1.0 else 'failed'
                 images_to_video(
                     vis_frames,
-                    os.path.join(self.output_path, f'vis_{self.epoch}', f'{scene_id}'),
+                    os.path.join(self.output_path, f'vis_{self.epoch}', video_bucket, f'{scene_id}'),
                     f'{episode_id:04d}',
                     fps=6,
                     quality=9,

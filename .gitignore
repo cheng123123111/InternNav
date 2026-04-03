@@ -143,6 +143,11 @@ nohup.out
 
 wandb/
 logs/
+exports/
+tmp_stop_data/
+tmp_stop_phrase/
+tmp_episode267/
+tmp_episode267_t10/
 
 .vis_debug
 *.png

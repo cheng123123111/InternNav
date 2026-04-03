@@ -229,11 +229,14 @@ def init_distributed_mode(dist_url="env://", port=29529, backend="nccl", timeout
 
     import socket
 
+    num_gpus = max(torch.cuda.device_count(), 1)
+    device_id = local_rank % num_gpus
+
     print(f"Rank {os.getenv('RANK')} / {os.getenv('WORLD_SIZE')} on {socket.gethostname()}:{os.getenv('MASTER_PORT')}")
-    print('| distributed init (rank {}): {}, gpu {}'.format(rank, dist_url, local_rank), flush=True)
+    print('| distributed init (rank {}): {}, gpu {}'.format(rank, dist_url, device_id), flush=True)
 
     # Device selection must happen before NCCL init
-    torch.cuda.set_device(local_rank)
+    torch.cuda.set_device(device_id)
 
     dist.init_process_group(
         backend=backend, init_method=dist_url, world_size=world_size, rank=rank, timeout=datetime.timedelta(0, 7200)

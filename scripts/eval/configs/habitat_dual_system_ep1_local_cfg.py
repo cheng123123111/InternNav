@@ -8,24 +8,22 @@ eval_cfg = EvalCfg(
             "mode": "dual_system",
             "model_path": "checkpoints/InternVLA-N1-DualVLN",
             "num_history": 8,
-            "resize_w": 384,
-            "resize_h": 384,
-            "max_new_tokens": 1024,
-            # Enable per-episode debug videos so every selected episode produces a video.
+            "resize_w": 320,
+            "resize_h": 320,
+            "max_new_tokens": 256,
             "vis_debug": True,
-            "vis_debug_path": "./logs/habitat/video20/vis_debug",
+            "vis_debug_path": "./logs/habitat/ep1_local/vis_debug",
         },
     ),
     env=EnvCfg(
         env_type='habitat',
         env_settings={
-            'config_path': 'scripts/eval/configs/vln_r2r_video20.yaml',
+            'config_path': 'scripts/eval/configs/vln_r2r_ep1_local.yaml',
         },
     ),
     eval_type='habitat_vln',
     eval_settings={
-        "output_path": "./logs/habitat/video20",
-        # Keep success videos too; debug videos cover all episodes.
+        "output_path": "./logs/habitat/ep1_local",
         "save_video": True,
         "epoch": 0,
         "max_steps_per_episode": 500,

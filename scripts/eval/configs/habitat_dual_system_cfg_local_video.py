@@ -11,21 +11,19 @@ eval_cfg = EvalCfg(
             "resize_w": 384,
             "resize_h": 384,
             "max_new_tokens": 1024,
-            # Enable per-episode debug videos so every selected episode produces a video.
-            "vis_debug": True,
-            "vis_debug_path": "./logs/habitat/video20/vis_debug",
+            "vis_debug": False,
+            "vis_debug_path": "./logs/habitat/vis_debug",
         },
     ),
     env=EnvCfg(
         env_type='habitat',
         env_settings={
-            'config_path': 'scripts/eval/configs/vln_r2r_video20.yaml',
+            'config_path': 'scripts/eval/configs/vln_r2r_local.yaml',
         },
     ),
     eval_type='habitat_vln',
     eval_settings={
-        "output_path": "./logs/habitat/video20",
-        # Keep success videos too; debug videos cover all episodes.
+        "output_path": "./logs/habitat/full_val_unseen_local_video",
         "save_video": True,
         "epoch": 0,
         "max_steps_per_episode": 500,
