@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Force Habitat-Sim to use the host NVIDIA GL/EGL stack instead of conda's
+# libEGL/libGLdispatch copies. Without this, headless renderer initialization
+# can fail with "cannot retrieve OpenGL version" on server machines.
+export LD_PRELOAD="/lib/x86_64-linux-gnu/libEGL.so.1:/lib/x86_64-linux-gnu/libOpenGL.so.0:/lib/x86_64-linux-gnu/libGLdispatch.so.0${LD_PRELOAD:+:${LD_PRELOAD}}"
+
 CONFIG="scripts/eval/configs/habitat_dual_system_cfg_local.py"
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 MASTER_PORT="${MASTER_PORT:-2333}"

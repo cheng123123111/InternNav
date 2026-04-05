@@ -18,6 +18,7 @@ from PIL import Image
 from transformers import AutoProcessor
 
 from internnav.model.basemodel.internvla_n1.internvla_n1 import InternVLAN1ForCausalLM
+from internnav.model.utils.attention import load_pretrained_with_attention_fallback
 from internnav.model.utils.vln_utils import S2Output, split_and_clean, traj_to_actions
 
 DEFAULT_IMAGE_TOKEN = "<image>"
@@ -28,10 +29,10 @@ class InternVLAN1AsyncAgent:
         self.device = torch.device(args.device)
         self.save_dir = "test_data/" + datetime.now().strftime("%Y%m%d_%H%M%S")
         print(f"args.model_path{args.model_path}")
-        self.model = InternVLAN1ForCausalLM.from_pretrained(
+        self.model = load_pretrained_with_attention_fallback(
+            InternVLAN1ForCausalLM,
             args.model_path,
             torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
             device_map={"": self.device},
         )
         self.model.eval()

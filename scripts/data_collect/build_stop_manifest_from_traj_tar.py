@@ -63,6 +63,11 @@ def parse_args():
         default=1,
         help="Number of recent frames to keep for each sample. Use 5 for short history aggregation.",
     )
+    parser.add_argument(
+        "--manifest-only",
+        action="store_true",
+        help="Only write manifest metadata and tar-backed frame references. Do not extract image files.",
+    )
     return parser.parse_args()
 
 
@@ -80,6 +85,14 @@ def load_single_jsonl_member(tar: tarfile.TarFile, member_name: str) -> dict:
     with tar.extractfile(member_name) as f:
         line = f.readline().decode("utf-8").strip()
     return json.loads(line) if line else {}
+
+
+def has_member(tar: tarfile.TarFile, member_name: str) -> bool:
+    try:
+        tar.getmember(member_name)
+        return True
+    except KeyError:
+        return False
 
 
 def list_rgb_members(tar: tarfile.TarFile, episode_root: str) -> list[str]:
@@ -100,8 +113,13 @@ def save_member_bytes(tar: tarfile.TarFile, member_name: str, output_path: Path,
         dst.write(src.read())
 
 
+def make_frame_ref(tar_path: Path, member_name: str) -> str:
+    return f"{tar_path}:::{member_name}"
+
+
 def build_history_frame_paths(
     tar: tarfile.TarFile,
+    tar_path: Path,
     rgb_members: list[str],
     target_idx: int,
     scene_id: str,
@@ -110,13 +128,18 @@ def build_history_frame_paths(
     frames_root: Path,
     history_frames: int,
     overwrite: bool,
+    manifest_only: bool,
 ) -> list[str]:
     start_idx = max(0, target_idx - history_frames + 1)
     history_paths = []
     for idx in range(start_idx, target_idx + 1):
-        history_path = frames_root / label_dir / scene_id / f"{episode_id}_frame_{idx:03d}.jpg"
-        save_member_bytes(tar, rgb_members[idx], history_path, overwrite)
-        history_paths.append(str(history_path))
+        member_name = rgb_members[idx]
+        if manifest_only:
+            history_paths.append(make_frame_ref(tar_path, member_name))
+        else:
+            history_path = frames_root / label_dir / scene_id / f"{episode_id}_frame_{idx:03d}.jpg"
+            save_member_bytes(tar, member_name, history_path, overwrite)
+            history_paths.append(str(history_path))
     return history_paths
 
 
@@ -137,9 +160,15 @@ def build_rows_for_episode(
     negative_offsets: list[int],
     overwrite: bool,
     history_frames: int,
+    manifest_only: bool,
 ) -> list[dict]:
-    tasks = load_single_jsonl_member(tar, f"{episode_root}/meta/tasks.jsonl")
-    episodes = load_single_jsonl_member(tar, f"{episode_root}/meta/episodes.jsonl")
+    tasks_name = f"{episode_root}/meta/tasks.jsonl"
+    episodes_name = f"{episode_root}/meta/episodes.jsonl"
+    if not has_member(tar, tasks_name) or not has_member(tar, episodes_name):
+        return []
+
+    tasks = load_single_jsonl_member(tar, tasks_name)
+    episodes = load_single_jsonl_member(tar, episodes_name)
     rgb_members = list_rgb_members(tar, episode_root)
     if not rgb_members:
         return []
@@ -155,9 +184,12 @@ def build_rows_for_episode(
     rows = []
     positive_idx = frame_count - 1
     positive_path = frames_root / "positive" / scene_id / f"{episode_id}_last.jpg"
-    save_member_bytes(tar, rgb_members[positive_idx], positive_path, overwrite)
+    positive_ref = make_frame_ref(tar_path, rgb_members[positive_idx])
+    if not manifest_only:
+        save_member_bytes(tar, rgb_members[positive_idx], positive_path, overwrite)
     positive_history_paths = build_history_frame_paths(
         tar=tar,
+        tar_path=tar_path,
         rgb_members=rgb_members,
         target_idx=positive_idx,
         scene_id=scene_id,
@@ -166,6 +198,7 @@ def build_rows_for_episode(
         frames_root=frames_root,
         history_frames=history_frames,
         overwrite=overwrite,
+        manifest_only=manifest_only,
     )
     rows.append(
         {
@@ -175,7 +208,7 @@ def build_rows_for_episode(
             "stop_phrase": stop_phrase,
             "stop_object_phrase": stop_object_phrase,
             "usable_stop_object_phrase": usable_stop_object_phrase,
-            "image_path": str(positive_path),
+            "image_path": positive_ref if manifest_only else str(positive_path),
             "source_tar": str(tar_path),
             "member_name": rgb_members[positive_idx],
             "frame_index": positive_idx,
@@ -195,9 +228,12 @@ def build_rows_for_episode(
             continue
         used_negative_indices.add(neg_idx)
         negative_path = frames_root / "negative" / scene_id / f"{episode_id}_frame_{neg_idx:03d}.jpg"
-        save_member_bytes(tar, rgb_members[neg_idx], negative_path, overwrite)
+        negative_ref = make_frame_ref(tar_path, rgb_members[neg_idx])
+        if not manifest_only:
+            save_member_bytes(tar, rgb_members[neg_idx], negative_path, overwrite)
         negative_history_paths = build_history_frame_paths(
             tar=tar,
+            tar_path=tar_path,
             rgb_members=rgb_members,
             target_idx=neg_idx,
             scene_id=scene_id,
@@ -206,6 +242,7 @@ def build_rows_for_episode(
             frames_root=frames_root,
             history_frames=history_frames,
             overwrite=overwrite,
+            manifest_only=manifest_only,
         )
         rows.append(
             {
@@ -215,7 +252,7 @@ def build_rows_for_episode(
                 "stop_phrase": stop_phrase,
                 "stop_object_phrase": stop_object_phrase,
                 "usable_stop_object_phrase": usable_stop_object_phrase,
-                "image_path": str(negative_path),
+                "image_path": negative_ref if manifest_only else str(negative_path),
                 "source_tar": str(tar_path),
                 "member_name": rgb_members[neg_idx],
                 "frame_index": neg_idx,
@@ -261,6 +298,7 @@ def main():
                         negative_offsets=negative_offsets,
                         overwrite=args.overwrite,
                         history_frames=args.history_frames,
+                        manifest_only=args.manifest_only,
                     )
                     if not rows:
                         continue

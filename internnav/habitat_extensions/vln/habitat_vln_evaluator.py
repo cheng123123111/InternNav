@@ -44,12 +44,20 @@ from internnav.habitat_extensions.vln.utils import (
 )
 from internnav.model.basemodel.internvla_n1.internvla_n1 import InternVLAN1ForCausalLM
 from internnav.model.basemodel.LongCLIP.model import longclip
+from internnav.model.utils.attention import load_pretrained_with_attention_fallback
 from internnav.model.utils.vln_utils import split_and_clean, traj_to_actions
 from scripts.data_collect.stop_alignment_utils import (
     extract_stop_target_elements,
     extract_stop_object_phrase,
     extract_stop_phrase,
     is_usable_stop_object_phrase,
+)
+from scripts.data_collect.train_stop_element_longclip_history import (
+    CrossAttentionStopHead,
+    GroundingQueryStopHead,
+    HistoryElementLongCLIPHead,
+    encode_image_with_patch_tokens,
+    forward_stop_head,
 )
 
 # Import for Habitat registry side effects — do not remove
@@ -76,6 +84,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
     def __init__(self, cfg: EvalCfg):
         args = argparse.Namespace(**cfg.eval_settings)
         self.save_video = args.save_video
+        self.save_front_video_only = bool(getattr(args, "save_front_video_only", False))
         self.epoch = args.epoch
         self.max_steps_per_episode = args.max_steps_per_episode
         self.output_path = args.output_path
@@ -139,17 +148,17 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         device_id = self.local_rank % gpu_count
         device = torch.device(f"cuda:{device_id}")
         if self.model_args.mode == 'dual_system':
-            model = InternVLAN1ForCausalLM.from_pretrained(
+            model = load_pretrained_with_attention_fallback(
+                InternVLAN1ForCausalLM,
                 self.model_args.model_path,
                 torch_dtype=torch.bfloat16,
-                attn_implementation="flash_attention_2",
                 device_map={"": device},
             )
         elif self.model_args.mode == 'system2':
-            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model = load_pretrained_with_attention_fallback(
+                Qwen2_5_VLForConditionalGeneration,
                 self.model_args.model_path,
                 torch_dtype=torch.bfloat16,
-                attn_implementation="flash_attention_2",
                 device_map={"": device},
             )
         else:
@@ -165,6 +174,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self.longclip_projector = None
         self.longclip_head = None
         self.longclip_mode = "projector"
+        self.longclip_head_type = "projector"
 
         if self.enable_longclip_stop_verify:
             self.longclip_model, self.longclip_preprocess = longclip.load(self.longclip_stop_model_path, device=device)
@@ -172,19 +182,61 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             feature_dim = int(self.longclip_model.text_projection.shape[-1])
             if "head" in ckpt:
                 self.longclip_mode = "elements"
-                self.longclip_head = {
-                    "image_proj.weight": ckpt["head"]["image_proj.weight"].to(device),
-                    "image_proj.bias": ckpt["head"]["image_proj.bias"].to(device),
-                    "text_proj.weight": ckpt["head"]["text_proj.weight"].to(device),
-                    "text_proj.bias": ckpt["head"]["text_proj.bias"].to(device),
-                    "score_head.0.weight": ckpt["head"]["score_head.0.weight"].to(device),
-                    "score_head.0.bias": ckpt["head"]["score_head.0.bias"].to(device),
-                    "score_head.2.weight": ckpt["head"]["score_head.2.weight"].to(device),
-                    "score_head.2.bias": ckpt["head"]["score_head.2.bias"].to(device),
-                    "obj_threshold": float(ckpt.get("obj_threshold", 0.25)),
-                    "coverage_temperature": float(ckpt.get("coverage_temperature", 12.0)),
-                    "max_target_elements": int(ckpt.get("max_target_elements", 4)),
-                }
+                self.longclip_head_type = str(ckpt.get("head_type", "mlp"))
+                head_state = ckpt["head"]
+                obj_threshold = float(ckpt.get("obj_threshold", 0.25))
+                coverage_temperature = float(ckpt.get("coverage_temperature", 12.0))
+                max_target_elements = int(ckpt.get("max_target_elements", 4))
+                history_frames = int(ckpt.get("history_frames", 5))
+                if self.longclip_head_type == "grounding_v4":
+                    self.longclip_head = GroundingQueryStopHead(
+                        feature_dim,
+                        int(ckpt["proj_dim"]),
+                        hidden_dim=int(ckpt["hidden_dim"]),
+                        num_heads=int(ckpt.get("attn_heads", 4)),
+                        dropout=float(ckpt.get("attn_dropout", 0.0)),
+                    ).to(device)
+                    self.longclip_head.load_state_dict(head_state, strict=True)
+                    self.longclip_head.eval()
+                    self.longclip_head_meta = {
+                        "obj_threshold": obj_threshold,
+                        "coverage_temperature": coverage_temperature,
+                        "max_target_elements": max_target_elements,
+                        "history_frames": history_frames,
+                    }
+                elif self.longclip_head_type == "cross_attn":
+                    self.longclip_head = CrossAttentionStopHead(
+                        feature_dim,
+                        int(ckpt["proj_dim"]),
+                        hidden_dim=int(ckpt["hidden_dim"]),
+                        num_heads=int(ckpt.get("attn_heads", 4)),
+                        dropout=float(ckpt.get("attn_dropout", 0.0)),
+                    ).to(device)
+                    self.longclip_head.load_state_dict(head_state, strict=True)
+                    self.longclip_head.eval()
+                    self.longclip_head_meta = {
+                        "obj_threshold": obj_threshold,
+                        "coverage_temperature": coverage_temperature,
+                        "max_target_elements": max_target_elements,
+                        "history_frames": history_frames,
+                    }
+                else:
+                    score_head_state = {
+                        key: value.to(device)
+                        for key, value in head_state.items()
+                        if key.startswith("score_head.")
+                    }
+                    self.longclip_head = {
+                        "image_proj.weight": head_state["image_proj.weight"].to(device),
+                        "image_proj.bias": head_state["image_proj.bias"].to(device),
+                        "text_proj.weight": head_state["text_proj.weight"].to(device),
+                        "text_proj.bias": head_state["text_proj.bias"].to(device),
+                        "score_head_state": score_head_state,
+                        "obj_threshold": obj_threshold,
+                        "coverage_temperature": coverage_temperature,
+                        "max_target_elements": max_target_elements,
+                        "history_frames": history_frames,
+                    }
             else:
                 proj_dim = int(ckpt["proj_dim"])
                 self.longclip_projector = {
@@ -421,61 +473,119 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         return F.linear(feats, weight, bias)
 
     def _longclip_score_head(self, stats: torch.Tensor) -> torch.Tensor:
-        hidden = F.linear(
-            stats,
-            self.longclip_head["score_head.0.weight"],
-            self.longclip_head["score_head.0.bias"],
+        x = stats
+        score_head_state = self.longclip_head["score_head_state"]
+        linear_ids = sorted(
+            {
+                int(key.split(".")[1])
+                for key in score_head_state
+                if key.endswith(".weight") and key.startswith("score_head.")
+            }
         )
-        hidden = F.gelu(hidden)
-        return F.linear(
-            hidden,
-            self.longclip_head["score_head.2.weight"],
-            self.longclip_head["score_head.2.bias"],
-        ).squeeze(-1)
+        last_linear_id = linear_ids[-1]
+        for layer_id in linear_ids:
+            x = F.linear(
+                x,
+                score_head_state[f"score_head.{layer_id}.weight"],
+                score_head_state[f"score_head.{layer_id}.bias"],
+            )
+            if layer_id != last_linear_id:
+                x = F.gelu(x)
+        return x.squeeze(-1)
 
-    def _verify_stop_with_longclip(self, instruction: str, image: Image.Image) -> tuple[bool, str]:
-        image_tensor = self.longclip_preprocess(image).unsqueeze(0).to(self.device)
+    def _verify_stop_with_longclip(self, instruction: str, images) -> tuple[bool, str]:
+        if isinstance(images, Image.Image):
+            images = [images]
+        images = list(images)
+        if not images:
+            return False, "no_image"
+
+        history_frames = int(
+            (self.longclip_head_meta["history_frames"] if hasattr(self, "longclip_head_meta") else self.longclip_head.get("history_frames", 1))
+            if self.longclip_mode == "elements"
+            else 1
+        )
+        images = images[-history_frames:]
+        image_tensor = torch.stack([self.longclip_preprocess(image) for image in images], dim=0).to(self.device)
         with torch.no_grad():
             image_features = self.longclip_model.encode_image(image_tensor).float()
             if self.longclip_mode == "elements":
                 elements = extract_stop_target_elements(
                     instruction,
-                    max_elements=self.longclip_head["max_target_elements"],
+                    max_elements=(
+                        self.longclip_head_meta["max_target_elements"]
+                        if hasattr(self, "longclip_head_meta")
+                        else self.longclip_head["max_target_elements"]
+                    ),
                 )
                 if not elements:
                     stop_object_phrase = extract_stop_object_phrase(instruction)
                     stop_phrase = extract_stop_phrase(instruction)
                     text = stop_object_phrase if is_usable_stop_object_phrase(stop_object_phrase) else stop_phrase
                     elements = [text]
-                text_tokens = longclip.tokenize(elements, truncate=True).to(self.device)
-                text_features = self.longclip_model.encode_text(text_tokens).float()
-                image_proj = self._longclip_project(
-                    image_features,
-                    self.longclip_head["image_proj.weight"],
-                    self.longclip_head["image_proj.bias"],
-                )
-                text_proj = self._longclip_project(
-                    text_features,
-                    self.longclip_head["text_proj.weight"],
-                    self.longclip_head["text_proj.bias"],
-                )
-                image_proj = F.normalize(image_proj, dim=-1)
-                text_proj = F.normalize(text_proj, dim=-1)
-                sims = (image_proj * text_proj).sum(dim=-1)
-                soft_coverage = torch.sigmoid(
-                    (sims - self.longclip_head["obj_threshold"]) * self.longclip_head["coverage_temperature"]
-                ).mean()
-                count_ratio = torch.tensor(
-                    len(elements) / max(self.longclip_head["max_target_elements"], 1),
-                    device=self.device,
-                    dtype=sims.dtype,
-                )
-                stats = torch.stack([sims.mean(), sims.max(), soft_coverage, count_ratio], dim=0).unsqueeze(0)
-                score = float(self._longclip_score_head(stats).item())
-                answer = (
-                    f"score={score:.4f} threshold={self.longclip_stop_threshold:.4f} "
-                    f"elements={elements!r} sims={[round(float(x), 4) for x in sims.tolist()]}"
-                )
+                if self.longclip_head_type in {"grounding_v4", "cross_attn"}:
+                    frame_cls, frame_patch = encode_image_with_patch_tokens(self.longclip_model, image_tensor)
+                    text_tokens = longclip.tokenize(elements, truncate=True).to(self.device)
+                    stop_phrase = extract_stop_phrase(instruction)
+                    relation_text = stop_phrase or instruction
+                    stop_object_phrase = extract_stop_object_phrase(instruction)
+                    action_text = stop_phrase or stop_object_phrase or instruction
+                    text_features = self.longclip_model.encode_text(text_tokens).float()
+                    action_features = self.longclip_model.encode_text(
+                        longclip.tokenize([action_text], truncate=True).to(self.device)
+                    ).float()
+                    relation_features = self.longclip_model.encode_text(
+                        longclip.tokenize([relation_text], truncate=True).to(self.device)
+                    ).float()
+                    logits, raw_scores, uncertainties, embeddings = forward_stop_head(
+                        self.longclip_head,
+                        frame_cls.float(),
+                        frame_patch.float() if self.longclip_head_type == "grounding_v4" else None,
+                        [0] * len(images),
+                        text_features,
+                        [0] * len(elements),
+                        action_features,
+                        relation_features,
+                        1,
+                        self.longclip_head_meta["max_target_elements"],
+                        self.longclip_head_meta["obj_threshold"],
+                        self.longclip_head_meta["coverage_temperature"],
+                    )
+                    score = float(torch.sigmoid(logits)[0].item())
+                    answer = (
+                        f"score={score:.4f} threshold={self.longclip_stop_threshold:.4f} "
+                        f"elements={elements!r} action={action_text!r}"
+                    )
+                else:
+                    text_tokens = longclip.tokenize(elements, truncate=True).to(self.device)
+                    text_features = self.longclip_model.encode_text(text_tokens).float()
+                    image_proj = self._longclip_project(
+                        image_features[-1:],
+                        self.longclip_head["image_proj.weight"],
+                        self.longclip_head["image_proj.bias"],
+                    )
+                    text_proj = self._longclip_project(
+                        text_features,
+                        self.longclip_head["text_proj.weight"],
+                        self.longclip_head["text_proj.bias"],
+                    )
+                    image_proj = F.normalize(image_proj, dim=-1)
+                    text_proj = F.normalize(text_proj, dim=-1)
+                    sims = (image_proj * text_proj).sum(dim=-1)
+                    soft_coverage = torch.sigmoid(
+                        (sims - self.longclip_head["obj_threshold"]) * self.longclip_head["coverage_temperature"]
+                    ).mean()
+                    count_ratio = torch.tensor(
+                        len(elements) / max(self.longclip_head["max_target_elements"], 1),
+                        device=self.device,
+                        dtype=sims.dtype,
+                    )
+                    stats = torch.stack([sims.mean(), sims.max(), soft_coverage, count_ratio], dim=0).unsqueeze(0)
+                    score = float(self._longclip_score_head(stats).item())
+                    answer = (
+                        f"score={score:.4f} threshold={self.longclip_stop_threshold:.4f} "
+                        f"elements={elements!r} sims={[round(float(x), 4) for x in sims.tolist()]}"
+                    )
             else:
                 stop_object_phrase = extract_stop_object_phrase(instruction)
                 stop_phrase = extract_stop_phrase(instruction)
@@ -494,7 +604,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 )
                 image_features = F.normalize(image_features, dim=-1)
                 text_features = F.normalize(text_features, dim=-1)
-                score = float((image_features * text_features).sum(dim=-1).item())
+                score = float((image_features[-1:] * text_features).sum(dim=-1).item())
                 answer = f"score={score:.4f} threshold={self.longclip_stop_threshold:.4f} text={text!r}"
         return score >= self.longclip_stop_threshold, answer
 
@@ -852,10 +962,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         if len(action_seq) != 0 and action_seq[0] == action_code.STOP and (
                             self.enable_qwen_stop_verify or self.enable_longclip_stop_verify
                         ):
+                            stop_verify_images = rgb_list[-max(int(getattr(self, "num_history", 1)), 1):] or [save_raw_image]
                             if self.enable_longclip_stop_verify:
                                 stop_accept, stop_answer = self._verify_stop_with_longclip(
                                     episode_instruction,
-                                    save_raw_image,
+                                    stop_verify_images,
                                 )
                                 stop_tag = "longclip_stop_verify"
                             else:
@@ -929,8 +1040,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                 info = self.env.get_metrics()
 
-                if info['top_down_map'] is not None and self.save_video:
-                    frame = observations_to_image({'rgb': np.asarray(save_raw_image)}, info)
+                if self.save_video:
+                    if info['top_down_map'] is not None and not self.save_front_video_only:
+                        frame = observations_to_image({'rgb': np.asarray(save_raw_image)}, info)
+                    else:
+                        frame = np.asarray(save_raw_image).copy()
                     if pixel_goal is not None and flag:
                         cv2.circle(frame, (pixel_goal[0], pixel_goal[1]), radius=8, color=(255, 0, 0), thickness=-1)
                     vis_frames.append(frame)
@@ -938,7 +1052,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 print("step_id", step_id, "action", action)
 
                 if vis_writer is not None:
-                    if info['top_down_map'] is not None:
+                    if info['top_down_map'] is not None and not self.save_front_video_only:
                         vis = observations_to_image({'rgb': np.asarray(save_raw_image)}, info)
                     else:
                         vis = np.asarray(save_raw_image).copy()
@@ -1273,8 +1387,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                 info = self.env.get_metrics()
 
-                if info['top_down_map'] is not None and self.save_video:
-                    frame = observations_to_image({'rgb': np.asarray(save_raw_image)}, info)
+                if self.save_video:
+                    if info['top_down_map'] is not None and not self.save_front_video_only:
+                        frame = observations_to_image({'rgb': np.asarray(save_raw_image)}, info)
+                    else:
+                        frame = np.asarray(save_raw_image).copy()
                     if goal is not None and flag:
                         cv2.circle(frame, (pixel_goal[0], pixel_goal[1]), radius=8, color=(255, 0, 0), thickness=-1)
                     vis_frames.append(frame)
@@ -1282,7 +1399,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 print("step_id", step_id, "action", action)
 
                 if vis_writer is not None:
-                    if info['top_down_map'] is not None:
+                    if info['top_down_map'] is not None and not self.save_front_video_only:
                         vis = observations_to_image({'rgb': np.asarray(save_raw_image)}, info)
                     else:
                         vis = np.asarray(save_raw_image).copy()

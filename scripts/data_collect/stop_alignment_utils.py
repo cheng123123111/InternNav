@@ -3,7 +3,11 @@ import re
 
 STOP_PATTERNS = [
     r"\bstop\s+(?:by|near|at|in front of|beside|under|next to|on|inside)\b",
+    r"\bstop\s+when\b",
+    r"\bstop\s+once\b",
+    r"\bstop\s+after\b",
     r"\byou(?:'ll| will)\s+stop\b",
+    r"\bwait\s+when\b",
     r"\bhalt\b",
 ]
 
@@ -69,6 +73,12 @@ def extract_stop_phrase(instruction: str) -> str:
         lowered = sentence.lower()
         if any(re.search(pattern, lowered) for pattern in STOP_PATTERNS):
             return sentence
+    for idx in range(len(sentences) - 1, 0, -1):
+        lowered = sentences[idx].lower()
+        if re.search(r"^(?:that(?:'s| is)\s+where\s+you\s+will\s+wait|stop\s+there|wait\s+there|there)$", lowered):
+            prev = sentences[idx - 1]
+            if any(re.search(pattern, prev.lower()) for pattern in STOP_PATTERNS):
+                return prev
     return sentences[-1] if sentences else instruction.strip()
 
 
@@ -77,6 +87,9 @@ def extract_stop_object_phrase(instruction: str) -> str:
     lowered = phrase.lower()
     patterns = [
         r"\bstop\s+(?:by|near|at|beside|under|next to|in front of|on|inside)\s+(.*)$",
+        r"\bstop\s+when\s+you\s+(?:get\s+to|reach|are\s+at|arrive\s+at)\s+(.*)$",
+        r"\bstop\s+once\s+you\s+(?:get\s+to|reach|are\s+at|arrive\s+at)\s+(.*)$",
+        r"\bstop\s+after\s+you\s+(?:pass|reach)\s+(.*)$",
         r"\byou(?:'ll| will)\s+stop\s+(?:by|near|at|beside|under|next to|in front of|on|inside)\s+(.*)$",
         r"\bwait\s+(?:by|near|at|beside|under|next to|in front of|in|on|inside)\s+(.*)$",
         r"\bhalt\s+(?:by|near|at|beside|under|next to|in front of|on|inside)\s+(.*)$",
